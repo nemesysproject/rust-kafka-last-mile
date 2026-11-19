@@ -18,6 +18,7 @@ backend-rust/target/
 frontend-angular/node_modules/
 frontend-angular/dist/
 frontend-angular/.angular/
+frontend-angular/package-lock.json
 
 # Python / Airflow
 __pycache__/
