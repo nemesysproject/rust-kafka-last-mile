@@ -10,7 +10,7 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Row};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -94,6 +94,7 @@ pub struct FleetStatusResponse {
     pub simulator_active: bool,
     pub active_drivers: usize,
     pub total_recent_alerts: usize,
+    pub data_source: &'static str,
     pub vehicles: Vec<GpsTelemetryPayload>,
     pub alerts: Vec<RouteAlertPayload>,
 }
@@ -110,9 +111,149 @@ pub struct DailyZoneKpiDto {
     pub computed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize, FromRow)]
+pub struct DeliveryDto {
+    pub delivery_id: i64,
+    pub driver_id: String,
+    pub driver_name: String,
+    pub zone: String,
+    pub package_code: String,
+    pub status: String,
+    pub scheduled_time: DateTime<Utc>,
+    pub delivered_time: Option<DateTime<Utc>>,
+    pub distance_km: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RouteOptimizationDto {
+    pub optimization_id: i64,
+    pub target_date: NaiveDate,
+    pub driver_id: String,
+    pub driver_name: String,
+    pub assigned_zone: String,
+    pub recommended_waypoints: serde_json::Value,
+    pub estimated_saving_km: f64,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AlertQuery {
     pub limit: Option<usize>,
+}
+
+/// Consulta PostgreSQL para obtener la ultima posicion de cada repartidor (`drivers` + `LATERAL gps_telemetry`)
+pub async fn fetch_fleet_from_postgres(pool: &PgPool) -> Result<Vec<GpsTelemetryPayload>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            d.driver_id,
+            d.driver_name,
+            d.zone,
+            d.assigned_lat,
+            d.assigned_lon,
+            d.delivery_lat,
+            d.delivery_lon,
+            COALESCE(t.latitude, d.assigned_lat) AS latitude,
+            COALESCE(t.longitude, d.assigned_lon) AS longitude,
+            COALESCE(t.speed_kmh, 35.0) AS speed_kmh,
+            COALESCE(t.delivery_status, d.status) AS delivery_status,
+            COALESCE(t.deviation_meters, 0.0) AS deviation_meters,
+            COALESCE(t.recorded_at, d.updated_at) AS recorded_at
+        FROM drivers d
+        LEFT JOIN LATERAL (
+            SELECT latitude, longitude, speed_kmh, delivery_status, deviation_meters, recorded_at
+            FROM gps_telemetry gt
+            WHERE gt.driver_id = d.driver_id
+            ORDER BY gt.recorded_at DESC
+            LIMIT 1
+        ) t ON TRUE
+        ORDER BY d.driver_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let vehicles = rows
+        .into_iter()
+        .map(|r| {
+            let speed_kmh: f64 = r.get("speed_kmh");
+            let status: String = r.get("delivery_status");
+            let idle_mins = if speed_kmh <= 0.5 && status == "IDLE_STOPPED" {
+                12.0
+            } else {
+                0.0
+            };
+
+            GpsTelemetryPayload {
+                driver_id: r.get("driver_id"),
+                driver_name: Some(r.get("driver_name")),
+                zone: Some(r.get("zone")),
+                latitude: r.get("latitude"),
+                longitude: r.get("longitude"),
+                speed_kmh,
+                delivery_status: status,
+                assigned_lat: Some(r.get("assigned_lat")),
+                assigned_lon: Some(r.get("assigned_lon")),
+                delivery_lat: Some(r.get("delivery_lat")),
+                delivery_lon: Some(r.get("delivery_lon")),
+                deviation_meters: Some(r.get("deviation_meters")),
+                idle_minutes: Some(idle_mins),
+                timestamp: r.get("recorded_at"),
+            }
+        })
+        .collect();
+
+    Ok(vehicles)
+}
+
+/// Consulta PostgreSQL para obtener las alertas de ruta (`route_alerts` JOIN `drivers`)
+pub async fn fetch_alerts_from_postgres(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<RouteAlertPayload>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            ra.alert_id::TEXT AS alert_id,
+            ra.driver_id,
+            COALESCE(d.driver_name, ra.driver_id) AS driver_name,
+            COALESCE(d.zone, 'Metropolitana') AS zone,
+            ra.alert_type,
+            ra.severity,
+            ra.message,
+            ra.latitude,
+            ra.longitude,
+            ra.metric_value,
+            ra.created_at
+        FROM route_alerts ra
+        LEFT JOIN drivers d ON d.driver_id = ra.driver_id
+        ORDER BY ra.created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let alerts = rows
+        .into_iter()
+        .map(|r| RouteAlertPayload {
+            alert_id: r.get("alert_id"),
+            driver_id: r.get("driver_id"),
+            driver_name: r.get("driver_name"),
+            zone: r.get("zone"),
+            alert_type: r.get("alert_type"),
+            severity: r.get("severity"),
+            message: r.get("message"),
+            latitude: r.get("latitude"),
+            longitude: r.get("longitude"),
+            metric_value: r.get("metric_value"),
+            created_at: r.get("created_at"),
+        })
+        .collect();
+
+    Ok(alerts)
 }
 
 /// Healthcheck del servicio Rust
@@ -212,8 +353,25 @@ pub async fn ingest_telemetry_handler(
     )
 }
 
-/// GET `/api/fleet/state`: Snapshot actual de todos los vehículos y alertas recientes
+/// GET `/api/fleet/state`: Consulta el estado actual de la flotilla y alertas directamente desde PostgreSQL (`drivers`, `gps_telemetry` y `route_alerts`)
 pub async fn get_fleet_state_handler(State(state): State<AppState>) -> Json<FleetStatusResponse> {
+    if let Some(ref pool) = state.db_pool {
+        if let (Ok(db_vehicles), Ok(db_alerts)) = (
+            fetch_fleet_from_postgres(pool).await,
+            fetch_alerts_from_postgres(pool, 50).await,
+        ) {
+            return Json(FleetStatusResponse {
+                simulator_active: state.simulator_running.load(Ordering::Relaxed),
+                active_drivers: db_vehicles.len(),
+                total_recent_alerts: db_alerts.len(),
+                data_source: "postgresql",
+                vehicles: db_vehicles,
+                alerts: db_alerts,
+            });
+        }
+    }
+
+    // Fallback a cache en memoria solo si PostgreSQL no esta disponible
     let vehicles: Vec<GpsTelemetryPayload> = {
         let guard = state.latest_fleet.read().await;
         let mut list: Vec<_> = guard.values().cloned().collect();
@@ -230,17 +388,25 @@ pub async fn get_fleet_state_handler(State(state): State<AppState>) -> Json<Flee
         simulator_active: state.simulator_running.load(Ordering::Relaxed),
         active_drivers: vehicles.len(),
         total_recent_alerts: alerts.len(),
+        data_source: "in_memory_fallback",
         vehicles,
         alerts,
     })
 }
 
-/// GET `/api/alerts`: Lista de alertas de desvío (>500m) e inactividad (>10 min)
+/// GET `/api/alerts`: Consulta las alertas de desvío (>500m) e inactividad (>10 min) desde la tabla `route_alerts` en PostgreSQL
 pub async fn get_alerts_handler(
     State(state): State<AppState>,
     Query(q): Query<AlertQuery>,
 ) -> Json<Vec<RouteAlertPayload>> {
     let limit = q.limit.unwrap_or(25).clamp(1, 100);
+
+    if let Some(ref pool) = state.db_pool {
+        if let Ok(db_alerts) = fetch_alerts_from_postgres(pool, limit as i64).await {
+            return Json(db_alerts);
+        }
+    }
+
     let guard = state.recent_alerts.read().await;
     let items: Vec<_> = guard.iter().take(limit).cloned().collect();
     Json(items)
@@ -315,10 +481,12 @@ pub async fn trigger_simulator_handler(
     )
 }
 
-/// GET `/api/kpis`: Obtiene los KPIs diarios por zona desde PostgreSQL (o datos semilla en fallback)
-pub async fn get_daily_kpis_handler(State(state): State<AppState>) -> Json<Vec<DailyZoneKpiDto>> {
+/// GET `/api/kpis`: Obtiene los KPIs diarios por zona desde la tabla `daily_zone_kpis` en PostgreSQL
+pub async fn get_daily_kpis_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Vec<DailyZoneKpiDto>>) {
     if let Some(ref pool) = state.db_pool {
-        if let Ok(rows) = sqlx::query_as::<_, DailyZoneKpiDto>(
+        match sqlx::query_as::<_, DailyZoneKpiDto>(
             "SELECT report_date, zone, total_deliveries, successful_deliveries, on_time_rate, total_alerts,
                     CAST(driver_payout_usd AS DOUBLE PRECISION) AS driver_payout_usd, computed_at
              FROM daily_zone_kpis
@@ -328,46 +496,93 @@ pub async fn get_daily_kpis_handler(State(state): State<AppState>) -> Json<Vec<D
         .fetch_all(pool)
         .await
         {
-            if !rows.is_empty() {
-                return Json(rows);
-            }
+            Ok(rows) => return (StatusCode::OK, Json(rows)),
+            Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(vec![])),
         }
     }
 
-    // Fallback en caso de ejecución sin base de datos
-    let today = Utc::now().date_naive();
-    Json(vec![
-        DailyZoneKpiDto {
-            report_date: today,
-            zone: "Norte-Industrial".to_string(),
-            total_deliveries: 24,
-            successful_deliveries: 23,
-            on_time_rate: 95.8,
-            total_alerts: 1,
-            driver_payout_usd: 145.50,
-            computed_at: Utc::now(),
-        },
-        DailyZoneKpiDto {
-            report_date: today,
-            zone: "Centro-Historico".to_string(),
-            total_deliveries: 31,
-            successful_deliveries: 28,
-            on_time_rate: 90.3,
-            total_alerts: 3,
-            driver_payout_usd: 172.00,
-            computed_at: Utc::now(),
-        },
-        DailyZoneKpiDto {
-            report_date: today,
-            zone: "Poniente-SantaFe".to_string(),
-            total_deliveries: 22,
-            successful_deliveries: 22,
-            on_time_rate: 100.0,
-            total_alerts: 0,
-            driver_payout_usd: 160.00,
-            computed_at: Utc::now(),
-        },
-    ])
+    (StatusCode::SERVICE_UNAVAILABLE, Json(vec![]))
+}
+
+/// GET `/api/deliveries`: Consulta el historial de entregas desde la tabla `deliveries` JOIN `drivers` en PostgreSQL
+pub async fn get_deliveries_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Vec<DeliveryDto>>) {
+    if let Some(ref pool) = state.db_pool {
+        if let Ok(rows) = sqlx::query_as::<_, DeliveryDto>(
+            r#"
+            SELECT
+                del.delivery_id,
+                del.driver_id,
+                COALESCE(d.driver_name, del.driver_id) AS driver_name,
+                del.zone,
+                del.package_code,
+                del.status,
+                del.scheduled_time,
+                del.delivered_time,
+                del.distance_km,
+                del.created_at
+            FROM deliveries del
+            LEFT JOIN drivers d ON d.driver_id = del.driver_id
+            ORDER BY del.created_at DESC
+            LIMIT 50
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        {
+            return (StatusCode::OK, Json(rows));
+        }
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(vec![]))
+}
+
+/// GET `/api/optimizations`: Consulta los planes de optimización de rutas generados por Airflow en la tabla `route_optimizations` de PostgreSQL
+pub async fn get_route_optimizations_handler(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Vec<RouteOptimizationDto>>) {
+    if let Some(ref pool) = state.db_pool {
+        if let Ok(rows) = sqlx::query(
+            r#"
+            SELECT
+                ro.optimization_id,
+                ro.target_date,
+                ro.driver_id,
+                COALESCE(d.driver_name, ro.driver_id) AS driver_name,
+                ro.assigned_zone,
+                ro.recommended_waypoints::TEXT AS waypoints_json,
+                ro.estimated_saving_km,
+                ro.created_at
+            FROM route_optimizations ro
+            LEFT JOIN drivers d ON d.driver_id = ro.driver_id
+            ORDER BY ro.target_date DESC, ro.driver_id ASC
+            LIMIT 30
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        {
+            let list = rows
+                .into_iter()
+                .map(|r| {
+                    let wp_str: String = r.get("waypoints_json");
+                    let wp_val = serde_json::from_str(&wp_str).unwrap_or(serde_json::json!([]));
+                    RouteOptimizationDto {
+                        optimization_id: r.get("optimization_id"),
+                        target_date: r.get("target_date"),
+                        driver_id: r.get("driver_id"),
+                        driver_name: r.get("driver_name"),
+                        assigned_zone: r.get("assigned_zone"),
+                        recommended_waypoints: wp_val,
+                        estimated_saving_km: r.get("estimated_saving_km"),
+                        created_at: r.get("created_at"),
+                    }
+                })
+                .collect();
+            return (StatusCode::OK, Json(list));
+        }
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(vec![]))
 }
 
 #[cfg(test)]

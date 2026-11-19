@@ -4,8 +4,10 @@ mod kafka;
 mod simulator;
 
 use crate::api::handlers::{
-    get_alerts_handler, get_daily_kpis_handler, get_fleet_state_handler, health_handler,
-    ingest_telemetry_handler, trigger_simulator_handler, AppState,
+    fetch_alerts_from_postgres, fetch_fleet_from_postgres, get_alerts_handler,
+    get_daily_kpis_handler, get_deliveries_handler, get_fleet_state_handler,
+    get_route_optimizations_handler, health_handler, ingest_telemetry_handler,
+    trigger_simulator_handler, AppState,
 };
 use crate::api::openapi::{openapi_json_handler, swagger_ui_handler};
 use crate::api::sse::telemetry_sse_handler;
@@ -39,7 +41,7 @@ async fn main() {
     let cfg = AppConfig::from_env();
     info!("Iniciando SwiftRoute Rust Core API & Stream Processor...");
 
-    // Conexión a PostgreSQL (tolerante a fallos para desarrollo local)
+    // Conexión a PostgreSQL
     let db_pool = match PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(std::time::Duration::from_secs(4))
@@ -59,8 +61,11 @@ async fn main() {
         }
     };
 
-    // Cargar rutas iniciales de repartidores desde Postgres o desde semilla en memoria
-    let mut initial_routes = default_fleet_routes();
+    // Cargar rutas, última posición de flotilla y alertas recientes desde PostgreSQL al arrancar
+    let mut initial_routes = HashMap::new();
+    let mut initial_fleet = HashMap::new();
+    let mut initial_alerts = Vec::new();
+
     if let Some(ref pool) = db_pool {
         if let Ok(rows) = sqlx::query(
             "SELECT driver_id, driver_name, zone, assigned_lat, assigned_lon, delivery_lat, delivery_lon FROM drivers",
@@ -83,7 +88,22 @@ async fn main() {
                     },
                 );
             }
+            info!("Cargados {} repartidores desde la tabla 'drivers' en PostgreSQL", initial_routes.len());
         }
+
+        if let Ok(fleet_list) = fetch_fleet_from_postgres(pool).await {
+            for v in fleet_list {
+                initial_fleet.insert(v.driver_id.clone(), v);
+            }
+        }
+
+        if let Ok(alerts_list) = fetch_alerts_from_postgres(pool, 50).await {
+            initial_alerts = alerts_list;
+        }
+    }
+
+    if initial_routes.is_empty() {
+        initial_routes = default_fleet_routes();
     }
 
     let producer = KafkaProducerService::new(
@@ -95,8 +115,8 @@ async fn main() {
     let (sse_tx, _) = broadcast::channel(512);
     let routes = Arc::new(RwLock::new(initial_routes));
     let idle_trackers = Arc::new(RwLock::new(HashMap::new()));
-    let latest_fleet = Arc::new(RwLock::new(HashMap::new()));
-    let recent_alerts = Arc::new(RwLock::new(Vec::new()));
+    let latest_fleet = Arc::new(RwLock::new(initial_fleet));
+    let recent_alerts = Arc::new(RwLock::new(initial_alerts));
     let simulator_running = Arc::new(AtomicBool::new(true));
 
     // Lanzar consumidor de Kafka en background
@@ -159,6 +179,8 @@ async fn main() {
         .route("/api/fleet/state", get(get_fleet_state_handler))
         .route("/api/alerts", get(get_alerts_handler))
         .route("/api/kpis", get(get_daily_kpis_handler))
+        .route("/api/deliveries", get(get_deliveries_handler))
+        .route("/api/optimizations", get(get_route_optimizations_handler))
         .route("/api/simulator/trigger", post(trigger_simulator_handler))
         .route("/api/sse/telemetry", get(telemetry_sse_handler))
         .route("/api/openapi.json", get(openapi_json_handler))

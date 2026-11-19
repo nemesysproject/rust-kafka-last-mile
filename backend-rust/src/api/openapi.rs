@@ -186,6 +186,46 @@ pub async fn openapi_json_handler() -> Json<serde_json::Value> {
                     }
                 }
             },
+            "/api/deliveries": {
+                "get": {
+                    "tags": ["Batch KPIs"],
+                    "summary": "Consultar historial de entregas registradas en PostgreSQL (`deliveries`)",
+                    "operationId": "getDeliveries",
+                    "responses": {
+                        "200": {
+                            "description": "Entregas registradas en la tabla `deliveries`",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "type": "object" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/optimizations": {
+                "get": {
+                    "tags": ["Batch KPIs"],
+                    "summary": "Consultar planes de optimizacion de rutas en PostgreSQL (`route_optimizations`)",
+                    "operationId": "getRouteOptimizations",
+                    "responses": {
+                        "200": {
+                            "description": "Planes de ruta del dia siguiente generados por Airflow",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "type": "object" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             "/api/sse/telemetry": {
                 "get": {
                     "tags": ["Real-Time SSE"],

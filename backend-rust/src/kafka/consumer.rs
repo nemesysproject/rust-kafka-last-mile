@@ -146,7 +146,7 @@ pub async fn evaluate_geofence_and_rules(
     }
     let _ = sse_tx.send(LiveStreamEvent::Telemetry(payload.clone()));
 
-    // Persistir telemetría en PostgreSQL si está disponible
+    // Persistir telemetría y sincronizar estado del repartidor en PostgreSQL si está disponible
     if let Some(pool) = db_pool {
         let _ = sqlx::query(
             "INSERT INTO gps_telemetry (driver_id, latitude, longitude, speed_kmh, delivery_status, deviation_meters, recorded_at)
@@ -158,6 +158,15 @@ pub async fn evaluate_geofence_and_rules(
         .bind(payload.speed_kmh)
         .bind(&payload.delivery_status)
         .bind(deviation_m)
+        .bind(payload.timestamp)
+        .execute(pool)
+        .await;
+
+        let _ = sqlx::query(
+            "UPDATE drivers SET status = $2, updated_at = $3 WHERE driver_id = $1",
+        )
+        .bind(&payload.driver_id)
+        .bind(&payload.delivery_status)
         .bind(payload.timestamp)
         .execute(pool)
         .await;
