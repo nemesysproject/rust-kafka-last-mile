@@ -1,0 +1,32 @@
+# =============================================================================
+# SwiftRoute Last-Mile · .gitignore
+# Proteccion de secretos, variables de entorno y artefactos de compilacion
+# =============================================================================
+
+# Archivos de entorno y secretos (NUNCA versionar)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Rust
+backend-rust/target/
+
+# Angular / Node
+frontend-angular/node_modules/
+frontend-angular/dist/
+frontend-angular/.angular/
+
+# Python / Airflow
+__pycache__/
+*.py[cod]
+.venv/
+orchestrator-airflow/logs/
+
+# IDEs & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
