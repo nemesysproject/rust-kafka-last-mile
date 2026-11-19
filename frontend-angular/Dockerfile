@@ -9,7 +9,7 @@ COPY . .
 RUN npm run build
 
 # Etapa 2: Nginx con Reverse Proxy para Rust API/SSE y Airflow REST API
-FROM nginx:1.27-alpine
+FROM nginx:1.31.9-alpine
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /app/dist/swiftroute-angular-dashboard/browser /usr/share/nginx/html
